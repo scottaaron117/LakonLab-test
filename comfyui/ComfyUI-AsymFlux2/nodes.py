@@ -120,6 +120,45 @@ class AsymFlux2LoadAdapter:
         flux.in_channels = ASYMFLUX_IN_CHANNELS * ASYMFLUX_PATCH_SIZE ** 2
         flux.out_channels = ASYMFLUX_OUT_CHANNELS * ASYMFLUX_PATCH_SIZE ** 2
 
+        # Diagnostic: print the state we left the model in.
+        try:
+            ii_shape = tuple(flux.img_in.weight.shape)
+        except Exception as e:
+            ii_shape = f'<error: {e}>'
+        try:
+            fl_shape = tuple(flux.final_layer.linear.weight.shape)
+        except Exception as e:
+            fl_shape = f'<error: {e}>'
+        print(f'[AsymFlux2LoadAdapter]   POST-SURGERY:'
+              f' img_in.weight={ii_shape},'
+              f' final_layer.linear.weight={fl_shape},'
+              f' patch_size={getattr(flux, "patch_size", "<missing>")},'
+              f' in_channels={getattr(flux, "in_channels", "<missing>")},'
+              f' out_channels={getattr(flux, "out_channels", "<missing>")}', flush=True)
+        try:
+            uc = patched.model.model_config.unet_config
+            print(f'[AsymFlux2LoadAdapter]   unet_config in_channels='
+                  f'{uc.get("in_channels", "?")}, out_channels={uc.get("out_channels", "?")}',
+                  flush=True)
+        except Exception as e:
+            print(f'[AsymFlux2LoadAdapter]   could not read unet_config: {e}', flush=True)
+
+        # Install a one-shot forward hook on img_in to print the incoming shape
+        # the first time the model is actually evaluated. The hook removes
+        # itself after firing so we don't spam the log.
+        _hook_state = {'fired': False, 'handle': None}
+        def _img_in_pre_hook(module, args):
+            if _hook_state['fired']:
+                return
+            _hook_state['fired'] = True
+            x = args[0] if args else None
+            shape = tuple(x.shape) if hasattr(x, 'shape') else type(x).__name__
+            print(f'[AsymFlux2 hook] img_in received input of shape {shape}; '
+                  f'module expects in_features={module.in_features}', flush=True)
+            if _hook_state['handle'] is not None:
+                _hook_state['handle'].remove()
+        _hook_state['handle'] = flux.img_in.register_forward_pre_hook(_img_in_pre_hook)
+
         # 2. Build patches dict and register with the ModelPatcher.
         # ComfyUI applies these LAZILY during weight load, so we never have to
         # offload the 18 GB base model.
