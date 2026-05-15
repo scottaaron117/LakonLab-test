@@ -39,6 +39,7 @@ from .oklab import (
     decode_oklab_latent_to_image,
 )
 from .latent_format import AsymFlux2Pixel
+from .asymflow_forward import install_asymflow_forward
 from .key_map import (
     translate,
     ASYMFLUX_PATCH_SIZE,
@@ -120,6 +121,11 @@ class AsymFlux2LoadAdapter:
         flux.patch_size = ASYMFLUX_PATCH_SIZE
         flux.in_channels = ASYMFLUX_IN_CHANNELS * ASYMFLUX_PATCH_SIZE ** 2
         flux.out_channels = ASYMFLUX_OUT_CHANNELS * ASYMFLUX_PATCH_SIZE ** 2
+
+        # Install AsymFlow's calibration + asymmetric-velocity recovery.
+        # Without this, the transformer's output is treated as standard flow
+        # velocity but is actually  u_A = P*eps - x_0  -- producing garbage.
+        install_asymflow_forward(flux, patch_size=ASYMFLUX_PATCH_SIZE)
 
         # Swap the latent format so ComfyUI's `fix_empty_latent_channels`
         # doesn't pad our 3-channel latent up to 128. Also keep unet_config
