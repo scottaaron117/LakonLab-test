@@ -29,13 +29,17 @@ except ImportError:
 
 import folder_paths  # ComfyUI module; only available when running inside ComfyUI
 
-from .adapter_loader import apply_adapter
+from .adapter_loader import (
+    apply_structural_surgery,
+    build_comfy_patches,
+)
 from .scheduler import compute_sigmas
 from .oklab import (
     encode_image_to_oklab_latent,
     decode_oklab_latent_to_image,
 )
 from .key_map import (
+    translate,
     ASYMFLUX_PATCH_SIZE,
     ASYMFLUX_IN_CHANNELS,
     ASYMFLUX_OUT_CHANNELS,
@@ -74,46 +78,60 @@ class AsymFlux2LoadAdapter:
     CATEGORY = 'AsymFlux2'
 
     def load(self, model, adapter_name: str, strict: bool = True):
+        import time
         if load_safetensors is None:
             raise RuntimeError(
                 'safetensors is not installed; run `pip install safetensors` '
                 'inside the ComfyUI environment.')
+
+        t0 = time.time()
         adapter_path = folder_paths.get_full_path('asymflux2', adapter_name)
+        print(f'[AsymFlux2LoadAdapter] loading {adapter_path} ...', flush=True)
         state = load_safetensors(adapter_path)
+        print(f'[AsymFlux2LoadAdapter]   safetensors loaded in {time.time()-t0:.1f}s '
+              f'({len(state)} keys)', flush=True)
 
-        # Clone the model patcher so we don't clobber the user's base model.
+        plan = translate(state)
+        if plan.unknown_keys:
+            msg = f'unknown adapter keys ({len(plan.unknown_keys)}): {plan.unknown_keys[:5]}'
+            if strict:
+                raise KeyError(msg)
+            print(f'[AsymFlux2LoadAdapter] WARN: {msg}', flush=True)
+
+        # Clone the patcher so we don't clobber the user's base model.
         patched = model.clone()
-
-        # ComfyUI loads weights lazily into VRAM; force-load and then unpatch
-        # so we can touch the underlying nn.Module without confusing the
-        # patcher's bookkeeping.
-        try:
-            patched.unpatch_model(device_to=torch.device('cpu'), unpatch_weights=True)
-        except Exception:
-            pass
-
         flux = patched.model.diffusion_model
 
-        # Pick compute dtype that matches the existing img_in (i.e. the base model).
+        # Pick compute dtype that matches the base model.
         try:
             compute_dtype = flux.img_in.weight.dtype
         except AttributeError:
             compute_dtype = torch.bfloat16
 
-        manifest = apply_adapter(
-            flux, state, compute_dtype=compute_dtype, strict=strict)
+        # 1. Structural surgery (tiny -- a few MB total, no model offload).
+        t1 = time.time()
+        manifest = apply_structural_surgery(flux, plan, compute_dtype)
+        print(f'[AsymFlux2LoadAdapter]   surgery done in {time.time()-t1:.1f}s: '
+              f'replaced={len(manifest["replaced_modules"])}, '
+              f'buffers={len(manifest["registered_buffers"])}', flush=True)
 
         # Re-declare patch grid / channels so Flux.process_img patches correctly.
         flux.patch_size = ASYMFLUX_PATCH_SIZE
         flux.in_channels = ASYMFLUX_IN_CHANNELS * ASYMFLUX_PATCH_SIZE ** 2
         flux.out_channels = ASYMFLUX_OUT_CHANNELS * ASYMFLUX_PATCH_SIZE ** 2
 
-        print(f'[AsymFlux2LoadAdapter] applied adapter `{adapter_name}`:'
-              f' replaced={len(manifest["replaced_modules"])},'
-              f' overwrote={len(manifest["overwrote_weights"])},'
-              f' buffers={len(manifest["registered_buffers"])},'
-              f' fused_loras={len(manifest["fused_loras"])},'
-              f' skipped={len(manifest["skipped"])}')
+        # 2. Build patches dict and register with the ModelPatcher.
+        # ComfyUI applies these LAZILY during weight load, so we never have to
+        # offload the 18 GB base model.
+        t2 = time.time()
+        patches = build_comfy_patches(plan)
+        print(f'[AsymFlux2LoadAdapter]   {len(patches)} patches built in '
+              f'{time.time()-t2:.1f}s (lora deltas materialized)', flush=True)
+
+        t3 = time.time()
+        patched.add_patches(patches, strength_patch=1.0, strength_model=1.0)
+        print(f'[AsymFlux2LoadAdapter]   patches registered in '
+              f'{time.time()-t3:.1f}s. total: {time.time()-t0:.1f}s', flush=True)
 
         return (patched,)
 

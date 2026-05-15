@@ -233,6 +233,44 @@ def test_module_replacement_is_size_768():
     assert model.scale_buffer.shape == ()
 
 
+def test_build_comfy_patches_produces_set_and_diff_tuples():
+    """Smoke-test the lazy-patch path used by the live ComfyUI node."""
+    from adapter_loader import build_comfy_patches
+    from key_map import translate
+
+    # Build a minimal fake adapter: just 1 LoRA + 1 weight-override + 2 buffers
+    # + 2 module-replacements. We won't run a model, just inspect the dict.
+    torch.manual_seed(0)
+    sd = {
+        'x_embedder.weight':      torch.randn(4096, 768, dtype=torch.float16),
+        'proj_out.weight':        torch.randn(768, 4096, dtype=torch.float16),
+        'norm_out.linear.weight': torch.randn(8192, 4096, dtype=torch.float16),
+        'proj_buffer':            torch.randn(768, 128, dtype=torch.bfloat16),
+        'scale_buffer':           torch.tensor(0.5, dtype=torch.bfloat16),
+        # One real LoRA pair (transformer_blocks.0.ff.linear_in)
+        'transformer_blocks.0.ff.linear_in.lora_A.weight':
+            torch.randn(256, 4096, dtype=torch.float16),
+        'transformer_blocks.0.ff.linear_in.lora_B.weight':
+            torch.randn(24576, 256, dtype=torch.float16),
+    }
+    plan = translate(sd)
+    patches = build_comfy_patches(plan)
+
+    # Expect: 1 set (norm_out) + 1 diff (the lora). Module replacements and
+    # buffers are NOT patches -- they go via structural surgery.
+    sets = [k for k, v in patches.items() if v[0] == 'set']
+    diffs = [k for k, v in patches.items() if v[0] == 'diff']
+    assert len(sets) == 1, sets
+    assert len(diffs) == 1, diffs
+    assert sets[0] == 'diffusion_model.final_layer.adaLN_modulation.1.weight'
+    assert diffs[0] == 'diffusion_model.double_blocks.0.img_mlp.0.weight'
+
+    # The diff delta should have shape matching the target weight.
+    delta = patches[diffs[0]][1][0]
+    assert delta.shape == (24576, 4096), delta.shape
+    assert delta.dtype == torch.float16
+
+
 if __name__ == '__main__':
     funcs = [v for k, v in globals().items() if k.startswith('test_') and callable(v)]
     failures = 0
