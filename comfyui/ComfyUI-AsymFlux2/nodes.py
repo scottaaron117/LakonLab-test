@@ -122,10 +122,36 @@ class AsymFlux2LoadAdapter:
         flux.in_channels = ASYMFLUX_IN_CHANNELS * ASYMFLUX_PATCH_SIZE ** 2
         flux.out_channels = ASYMFLUX_OUT_CHANNELS * ASYMFLUX_PATCH_SIZE ** 2
 
-        # Install AsymFlow's calibration + asymmetric-velocity recovery.
-        # Without this, the transformer's output is treated as standard flow
-        # velocity but is actually  u_A = P*eps - x_0  -- producing garbage.
-        install_asymflow_forward(flux, patch_size=ASYMFLUX_PATCH_SIZE)
+        # NOTE: in theory the AsymFlow model needs a calibration + asymmetric
+        # -> full velocity recovery wrapped around every model call (see
+        # `asymflow_forward.py`). In practice applying it produces noise,
+        # while *not* applying it produces a coherent (but over-saturated)
+        # image -- so the released adapter must already bake some of the
+        # transform in, or be configured for ~identity scale_buffer/proj.
+        # Leaving the recovery off until we understand which.
+        # install_asymflow_forward(flux, patch_size=ASYMFLUX_PATCH_SIZE)
+
+        # Print the AsymFlow buffer values so we can decide whether to apply
+        # the calibration/recovery in a future iteration.
+        try:
+            sb = flux.scale_buffer.float().item()
+            pb = flux.proj_buffer.float()
+            # Identity check: the proj_buffer is expected to be the top
+            # `base_rank=128` rows of an identity matrix padded to 768.
+            pb_eye_topleft = pb[:128, :128]
+            pb_pad_below = pb[128:, :]
+            is_identity = (
+                torch.allclose(pb_eye_topleft, torch.eye(128, device=pb.device, dtype=pb.dtype),
+                               atol=1e-3)
+                and pb_pad_below.abs().max().item() < 1e-3
+            )
+            print(f'[AsymFlux2LoadAdapter]   scale_buffer = {sb:.6f}'
+                  f'   proj_buffer is_identity_pattern = {is_identity}'
+                  f'   proj_buffer mean = {pb.mean().item():.4f},'
+                  f' max abs = {pb.abs().max().item():.4f}', flush=True)
+        except Exception as exc:
+            print(f'[AsymFlux2LoadAdapter]   could not inspect AsymFlow buffers: {exc}',
+                  flush=True)
 
         # Swap the latent format so ComfyUI's `fix_empty_latent_channels`
         # doesn't pad our 3-channel latent up to 128. Also keep unet_config
