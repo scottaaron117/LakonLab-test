@@ -38,6 +38,7 @@ from .oklab import (
     encode_image_to_oklab_latent,
     decode_oklab_latent_to_image,
 )
+from .latent_format import AsymFlux2Pixel
 from .key_map import (
     translate,
     ASYMFLUX_PATCH_SIZE,
@@ -119,6 +120,19 @@ class AsymFlux2LoadAdapter:
         flux.patch_size = ASYMFLUX_PATCH_SIZE
         flux.in_channels = ASYMFLUX_IN_CHANNELS * ASYMFLUX_PATCH_SIZE ** 2
         flux.out_channels = ASYMFLUX_OUT_CHANNELS * ASYMFLUX_PATCH_SIZE ** 2
+
+        # Swap the latent format so ComfyUI's `fix_empty_latent_channels`
+        # doesn't pad our 3-channel latent up to 128. Also keep unet_config
+        # in sync so downstream channel-based logic (e.g. Flux.concat_cond)
+        # sees the right shape.
+        patched.model.latent_format = AsymFlux2Pixel()
+        try:
+            patched.model.model_config.unet_config['in_channels'] = ASYMFLUX_IN_CHANNELS
+            patched.model.model_config.unet_config['out_channels'] = ASYMFLUX_OUT_CHANNELS
+            patched.model.model_config.latent_format = patched.model.latent_format
+        except Exception as exc:
+            print(f'[AsymFlux2LoadAdapter]   could not update model_config: {exc}',
+                  flush=True)
 
         # Diagnostic: print the state we left the model in.
         try:
